@@ -2,7 +2,7 @@
 
 안녕하세요. NVPlayer를 만든 ningning-voice 입니다. 
 
-프로그램명에서 볼 수 있듯이 제가 좋아하는 에스파와 같은 케이팝 아이돌의 노래를 듣기 위해서 직접 만든 음악 플레이어입니다. 
+프로그램명에서 볼 수 있듯이 제가 좋아하는 에스파와 같은 케이팝 아이돌의 노래를 듣기 위해서 2025년 8월 5일부터 직접 만든 음악 플레이어입니다. 
 
 아직 미완성이지만 사용하는데 (아마) 지장은 없습니다. 지원하는 코덱은 flac, mp3, ogg, wav 입니다. 
 
@@ -31,7 +31,7 @@
 
 Hello, I'm the ningning-voice who created NVPlayer. 
 
-As you can see from the name of the program, I made my own music player to listen to the songs of my favorite K-pop idols, like aespa. 
+As you can see from the name of the program, I made my own music player from August 5, 2025 to listen to the songs of my favorite K-pop idols, like aespa. 
 
 It's still incomplete, but it doesn't have a problem using it (probably). The supported codecs are flac, mp3, ogg, and wav. 
 
