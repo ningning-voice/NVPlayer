@@ -57,7 +57,12 @@ Most of the play button tabs are fine, but there is a bug where the EQ is still 
 There is also a mini-player feature.
 
 
+============================================================================================
 
 P.S.
 
 I'm a total stranger to coding (I can't even say I'm a developer). Any good ideas would be appreciated.
+
+P.P.S
+
+To be honest, I can't add an English version. It's hard.
