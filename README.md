@@ -19,6 +19,8 @@
 
 미니 플레이어 기능도 존재합니다.
 
+===============================================================================================================================================================
+
 Hello, I'm the ningning-voice who created NVPlayer. 
 As you can see from the name of the program, I made my own music player to listen to the songs of my favorite K-pop idols, like aespa. It's still incomplete, but it doesn't have a problem using it (probably). The supported codecs are flac, mp3, ogg, and wav. 
 
