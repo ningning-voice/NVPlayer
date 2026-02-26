@@ -1,7 +1,5 @@
 # NVPlayer
 
-<img width="1202" height="1030" alt="스크린샷 2026-02-26 000849" src="https://github.com/user-attachments/assets/f98be411-b523-4668-aeb6-20000d603d51" />
-
 안녕하세요. NVPlayer를 만든 ningning-voice 입니다. 
 
 프로그램명에서 볼 수 있듯이 제가 좋아하는 에스파와 같은 케이팝 아이돌의 노래를 듣기 위해서 직접 만든 음악 플레이어입니다. 
