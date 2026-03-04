@@ -5,6 +5,9 @@ import random
 import traceback
 import sqlite3
 import hashlib
+import time
+from collections import OrderedDict
+import concurrent.futures
 from PyQt5.QtWidgets import (
     QApplication,
     QWidget,
@@ -33,6 +36,7 @@ from PyQt5.QtWidgets import (
     QGraphicsRectItem,
     QMenuBar,
     QDialog,
+    QComboBox,
     QVBoxLayout as QDialogVBoxLayout,
     QTextBrowser,
     QDialogButtonBox,
@@ -53,11 +57,53 @@ from mutagen import File
 from mutagen.flac import FLAC
 import locale
 
+try:
+    import soundfile as sf
+    import sounddevice as sd
+    import numpy as np
+    SOUNDDEVICE_AVAILABLE = True
+except Exception:
+    SOUNDDEVICE_AVAILABLE = False
+
+import threading
+import math
+
+
+def read_json_file(path, default=None):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return default
+    return default
+
+
+def write_json_file(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def merge_json_file(path, updates):
+    try:
+        existing = read_json_file(path, {}) or {}
+        if not isinstance(existing, dict):
+            existing = {}
+        existing.update(updates or {})
+        return write_json_file(path, existing)
+    except Exception:
+        return False
+
 
 class ScanWorker(QObject):
     """파일 스캔 및 DB 업데이트를 백그라운드에서 수행"""
     finished = pyqtSignal(int, int)  # (added_count, deleted_count)
     progress = pyqtSignal(str)
+    batch = pyqtSignal(int, int)  # (added_so_far, total_new)
     error = pyqtSignal(str)
 
     def __init__(self, root_folder, db_path):
@@ -65,58 +111,141 @@ class ScanWorker(QObject):
         self.root_folder = root_folder
         self.db_path = db_path
         self.supported_formats = [".flac", ".mp3", ".ogg", ".wav"]
+        self.progress_throttle = 0.2  # seconds between progress emits
 
     def run(self):
+        conn = None
+        added_count = 0
+        deleted_paths = set()
         try:
-            conn = sqlite3.connect(self.db_path)
+            # Use WAL mode for better concurrency and set a longer timeout
+            conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
+            try:
+                cursor.execute('PRAGMA journal_mode=WAL')
+            except Exception:
+                pass
 
             # 1. DB에 있는 모든 파일 경로 가져오기
             cursor.execute("SELECT path FROM tracks")
             db_paths = set(row[0] for row in cursor.fetchall())
 
-            # 2. 파일 시스템에서 모든 오디오 파일 경로 가져오기
-            fs_paths = set()
+            # 2. 파일 시스템을 순회하며 DB에 없는 파일만 수집 (메모리 절약)
+            seen_paths = set()
+            new_paths = []
             for dirpath, _, filenames in os.walk(self.root_folder):
                 for filename in filenames:
                     if any(filename.lower().endswith(fmt) for fmt in self.supported_formats):
-                        fs_paths.add(os.path.join(dirpath, filename))
+                        full_path = os.path.join(dirpath, filename)
+                        seen_paths.add(full_path)
+                        if full_path not in db_paths:
+                            new_paths.append(full_path)
 
-            # 3. 변경점 비교
-            new_paths = fs_paths - db_paths
-            deleted_paths = db_paths - fs_paths
+            # 삭제된 파일 경로(이전에 DB에 있었으나 현재 파일시스템에서 보이지 않는 것)
+            deleted_paths = db_paths - seen_paths
 
             # 4. 삭제된 파일 DB에서 제거
             if deleted_paths:
                 self.progress.emit(f"{len(deleted_paths)}개 파일 삭제 중...")
-                cursor.executemany("DELETE FROM tracks WHERE path=?", [(path,) for path in deleted_paths])
-                conn.commit()
-
-            # 5. 새로 추가된 파일 스캔 및 DB에 추가
-            added_count = 0
-            total_new = len(new_paths)
-            for i, file_path in enumerate(new_paths):
-                self.progress.emit(f"새 파일 스캔 중 ({i + 1}/{total_new}): {os.path.basename(file_path)}")
-                track_info = self._extract_metadata(file_path)
-                if track_info:
+                try:
+                    cursor.executemany("DELETE FROM tracks WHERE path=?", [(path,) for path in deleted_paths])
+                    # also remove from FTS table if present
                     try:
-                        cursor.execute("""
-                            INSERT INTO tracks (path, artist, date, album, title, track, duration, raw_duration, lyrics)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, tuple(track_info.values()))
-                        added_count += 1
-                    except sqlite3.IntegrityError:
-                        # 이미 존재하는 경우 (거의 발생하지 않음)
+                        cursor.executemany("DELETE FROM tracks_fts WHERE path=?", [(path,) for path in deleted_paths])
+                    except Exception:
                         pass
-            if added_count > 0:
-                conn.commit()
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
-            conn.close()
-            self.finished.emit(added_count, len(deleted_paths))
+            # 5. 새로 추가된 파일 메타데이터 병렬 추출 후 DB에 일괄 삽입
+            total_new = len(new_paths)
+            last_emit = 0
+            track_results = []
+            if new_paths:
+                max_workers = min(8, (os.cpu_count() or 4))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futures = {ex.submit(self._extract_metadata, p): p for p in new_paths}
+                    processed = 0
+                    for fut in concurrent.futures.as_completed(futures):
+                        processed += 1
+                        try:
+                            track_info = fut.result()
+                        except Exception:
+                            track_info = None
+                        if track_info:
+                            track_results.append(track_info)
+                        # throttled progress update
+                        now = time.time()
+                        if now - last_emit >= self.progress_throttle:
+                            self.progress.emit(f"새 파일 스캔 중 ({min(processed, total_new)}/{total_new})...")
+                            last_emit = now
+
+                # insert results into DB in chunks with retry to avoid sqlite locked errors
+                chunk_size = 50
+                inserted_so_far = 0
+                insert_values = [(
+                    t.get('path'), t.get('artist'), t.get('date'), t.get('album'), t.get('title'),
+                    t.get('track'), t.get('duration'), t.get('raw_duration'), t.get('lyrics')
+                ) for t in track_results]
+
+                for i in range(0, len(insert_values), chunk_size):
+                    chunk = insert_values[i:i+chunk_size]
+                    attempts = 0
+                    success = False
+                    while attempts < 4 and not success:
+                        try:
+                            cursor.executemany(
+                                "INSERT OR IGNORE INTO tracks (path, artist, date, album, title, track, duration, raw_duration, lyrics) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                chunk
+                            )
+                            conn.commit()
+                            success = True
+                            inserted_so_far += len(chunk)
+                            added_count += len(chunk)
+                            # emit batch progress for UI partial update
+                            try:
+                                self.batch.emit(inserted_so_far, total_new)
+                            except Exception:
+                                pass
+                            # also update FTS table for this chunk if available
+                            try:
+                                fts_vals = [(c[0], c[1], c[3], c[4]) for c in chunk]
+                                cursor.executemany("INSERT OR REPLACE INTO tracks_fts (path, artist, album, title) VALUES (?, ?, ?, ?)", fts_vals)
+                                conn.commit()
+                            except Exception:
+                                # ignore if FTS not supported
+                                pass
+                        except sqlite3.OperationalError:
+                            attempts += 1
+                            time.sleep(0.1 * attempts)
+                        except Exception:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            attempts = 4
+                    if not success:
+                        # log but continue
+                        self.progress.emit(f"일부 파일 추가 중 오류 발생 (스킵): {i}-{i+len(chunk)}")
 
         except Exception as e:
             tb = traceback.format_exc()
             self.error.emit(f"파일 처리 중 오류 발생:\n{e}\n\n{tb}")
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+            # ensure finished emits even on errors so UI can re-enable controls
+            try:
+                self.finished.emit(added_count, len(deleted_paths))
+            except Exception:
+                pass
 
     def _extract_metadata(self, file_path):
         """단일 파일에서 메타데이터를 추출하여 dict로 반환"""
@@ -176,6 +305,167 @@ class ClickableLabel(QLabel):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton: self.clicked.emit()
         super().mousePressEvent(event)
+
+
+class SoundDevicePlayer:
+    """Simple player using soundfile + sounddevice for native FLAC playback."""
+    def __init__(self):
+        self.file = None
+        self.stream = None
+        self.lock = threading.Lock()
+        self.volume = 1.0
+        self.paused = False
+        self.samplerate = None
+        self.channels = None
+        self.frames_read = 0
+        self.length_frames = 0
+        # 10-band EQ default (dB): [31.25, 62.5, 125, 250, 500, 1k, 2k, 4k, 8k, 16k]
+        self.eq_gains = [0] * 10
+
+    def load(self, path):
+        self.stop()
+        self.file = sf.SoundFile(path)
+        self.samplerate = self.file.samplerate
+        self.channels = self.file.channels
+        try:
+            self.length_frames = len(self.file)
+        except Exception:
+            self.length_frames = 0
+        self.frames_read = 0
+
+    def _callback(self, outdata, frames, time_info, status):
+        with self.lock:
+            if self.file is None:
+                outdata.fill(0)
+                return
+            data = self.file.read(frames, dtype='float32', always_2d=True)
+            if data.shape[0] == 0:
+                outdata.fill(0)
+                raise sd.CallbackStop()
+            # apply equalizer before volume if configured
+            if data.shape[0] > 0 and any(g != 0 for g in self.eq_gains):
+                try:
+                    data = self.apply_eq(data)
+                except Exception:
+                    pass
+            if data.shape[0] < frames:
+                out = np.zeros((frames, self.channels), dtype='float32')
+                out[: data.shape[0], :] = data
+                outdata[:] = out * self.volume
+                self.frames_read += data.shape[0]
+                raise sd.CallbackStop()
+            else:
+                outdata[:] = data * self.volume
+                self.frames_read += data.shape[0]
+
+    def play(self, start=0.0):
+        if self.file is None: return
+        try:
+            start_frame = int(start * self.samplerate)
+            self.file.seek(start_frame)
+            self.frames_read = start_frame
+        except Exception:
+            pass
+        self.paused = False
+        self.stream = sd.OutputStream(samplerate=self.samplerate, channels=self.channels, callback=self._callback, dtype='float32')
+        self.stream.start()
+        print(f"SoundDevicePlayer: started playback (samplerate={self.samplerate}, channels={self.channels})")
+
+    def pause(self):
+        if self.stream and not self.paused:
+            try:
+                self.stream.stop()
+                self.paused = True
+            except Exception:
+                pass
+
+    def resume(self):
+        if self.stream and self.paused:
+            try:
+                self.stream.start()
+                self.paused = False
+            except Exception:
+                pass
+
+    def stop(self):
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        if self.file:
+            try:
+                self.file.close()
+            except Exception:
+                pass
+            self.file = None
+        self.frames_read = 0
+
+    def set_volume(self, vol):
+        try:
+            self.volume = float(vol)
+        except Exception:
+            pass
+
+    def set_eq_gains(self, gains):
+        """gains: list of ten dB values"""
+        try:
+            if gains is None:
+                self.eq_gains = [0] * 10
+            else:
+                self.eq_gains = list(gains)
+        except Exception:
+            pass
+
+    def apply_eq(self, data):
+        """Apply simple graphic EQ to numpy array of samples.
+        data shape: (frames, channels) float32
+        """
+        # compute frequency bins for current block length
+        n = data.shape[0]
+        freqs = np.fft.rfftfreq(n, 1.0 / self.samplerate)
+
+        # 10-band centers (Hz)
+        centers = [31.25, 62.5, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+        # compute edges as geometric mean between centers, with 0 and Nyquist bounds
+        edges = [0.0]
+        for i in range(len(centers) - 1):
+            edges.append(math.sqrt(centers[i] * centers[i + 1]))
+        edges.append(self.samplerate / 2.0)
+
+        gains = np.ones_like(freqs)
+        for idx, g_db in enumerate(self.eq_gains):
+            if idx >= len(centers):
+                break
+            try:
+                if g_db == 0:
+                    continue
+                lin = 10 ** (g_db / 20.0)
+                low = edges[idx]
+                high = edges[idx + 1]
+                mask = (freqs >= low) & (freqs < high)
+                gains[mask] *= lin
+            except Exception:
+                continue
+
+        # apply gains in frequency domain
+        data_fft = np.fft.rfft(data, axis=0)
+        data_fft *= gains[:, None]
+        data = np.fft.irfft(data_fft, n=n, axis=0)
+        return data
+
+    def get_pos_ms(self):
+        if not self.samplerate or self.samplerate == 0: return 0
+        return int((self.frames_read / float(self.samplerate)) * 1000)
+
+    def get_length_ms(self):
+        if not self.samplerate or self.samplerate == 0: return 0
+        return int((self.length_frames / float(self.samplerate)) * 1000)
+
+    def is_busy(self):
+        return self.stream is not None and not self.paused
 
 
 class AlbumIconWidget(QWidget):
@@ -350,6 +640,179 @@ class MiniPlayer(QWidget):
         self.old_pos = event.globalPos()
 
 
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_player = parent
+        self.setWindowTitle("설정")
+        self.setFixedSize(400, 250)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        layout = QDialogVBoxLayout(self)
+
+        backend_label = QLabel("오디오 백엔드:")
+        self.backend_combo = QComboBox()
+        self.backend_combo.addItem("자동 선택 (권장)", "auto")
+        if SOUNDDEVICE_AVAILABLE:
+            self.backend_combo.addItem("sounddevice (48kHz 원음)", "sounddevice")
+        self.backend_combo.addItem("pygame (호환성)", "pygame")
+        backend_layout = QHBoxLayout()
+        backend_layout.addWidget(backend_label)
+        backend_layout.addWidget(self.backend_combo)
+        layout.addLayout(backend_layout)
+
+        device_label = QLabel("재생 장치:")
+        self.device_combo = QComboBox()
+        if SOUNDDEVICE_AVAILABLE:
+            try:
+                devices = sd.query_devices()
+                default_dev = sd.default.device
+                default_out = default_dev[1] if isinstance(default_dev, tuple) else default_dev
+                for idx, dev in enumerate(devices):
+                    if dev['max_output_channels'] > 0:
+                        self.device_combo.addItem(f"{idx}: {dev['name']}", idx)
+                        if idx == default_out:
+                            self.device_combo.setCurrentIndex(self.device_combo.count() - 1)
+            except Exception:
+                pass
+        device_layout = QHBoxLayout()
+        device_layout.addWidget(device_label)
+        device_layout.addWidget(self.device_combo)
+        layout.addLayout(device_layout)
+
+        info_label = QLabel("폰트: Pretendard | FLAC는 48kHz로 재생")
+        if parent and "Medium" in parent.pretendard_fonts:
+            info_label.setFont(parent.pretendard_fonts["Medium"])
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #666; font-size: 10px;")
+        layout.addWidget(info_label)
+        layout.addStretch()
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+        self.load_settings()
+
+    def load_settings(self):
+        try:
+            if os.path.exists("player_settings.json"):
+                with open("player_settings.json", "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+                    backend = settings.get("audio_backend", "auto")
+                    device = settings.get("audio_device", None)
+                    idx = self.backend_combo.findData(backend)
+                    if idx >= 0:
+                        self.backend_combo.setCurrentIndex(idx)
+                    if device is not None and self.device_combo.count() > 0:
+                        dev_idx = self.device_combo.findData(device)
+                        if dev_idx >= 0:
+                            self.device_combo.setCurrentIndex(dev_idx)
+        except Exception:
+            pass
+
+    def get_settings(self):
+        return {"audio_backend": self.backend_combo.currentData(), "audio_device": self.device_combo.currentData() if self.device_combo.count() > 0 else None}
+
+
+class EQDialog(QDialog):
+    """Simple graphic equalizer dialog with ten bands. """
+    def __init__(self, parent=None, initial_gains=None):
+        super().__init__(parent)
+        self.setWindowTitle("이퀄라이저")
+        self.setFixedSize(400, 400)
+        layout = QVBoxLayout(self)
+        # presets
+        self.presets = {
+            "Flat": [0] * 10,
+            "Bass Boost": [6, 4, 2, 0, -1, -1, 0, 1, 2, 2],
+            "Treble Boost": [0, 0, 0, 0, 1, 2, 3, 4, 6, 6],
+            "Vocal": [-1, -1, 0, 1, 2, 3, 2, 1, 0, -1],
+            "Rock": [4, 2, 1, 0, 0, 1, 2, 3, 3, 2],
+        }
+        preset_layout = QHBoxLayout()
+        preset_label = QLabel("프리셋:")
+        self.preset_combo = QComboBox()
+        for name in self.presets.keys():
+            self.preset_combo.addItem(name)
+        self.preset_combo.addItem("Custom")
+        self.preset_combo.setCurrentIndex(0)
+        preset_layout.addWidget(preset_label)
+        preset_layout.addWidget(self.preset_combo)
+        layout.addLayout(preset_layout)
+        self.sliders = []
+        band_labels = ["31.25 Hz", "62.5 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz"]
+        for idx, label_text in enumerate(band_labels):
+            hbox = QHBoxLayout()
+            lbl = QLabel(label_text)
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(-12, 12)
+            value_label = QLabel()
+            val = 0
+            if initial_gains and idx < len(initial_gains):
+                try:
+                    val = int(initial_gains[idx])
+                except Exception:
+                    val = 0
+            slider.setValue(val)
+            value_label.setText(f"{val} dB")
+            # update label and mark preset as Custom when user adjusts sliders
+            def _on_slider_change(v, lbl=value_label, self_ref=None):
+                lbl.setText(f"{v} dB")
+                # mark custom if current slider set doesn't match selected preset
+                try:
+                    sel = self.preset_combo.currentText()
+                    if sel != "Custom":
+                        preset_vals = self.presets.get(sel, None)
+                        # check current sliders vs preset later after event loop
+                        self.preset_combo.setCurrentText("Custom")
+                except Exception:
+                    pass
+
+            slider.valueChanged.connect(_on_slider_change)
+            self.sliders.append(slider)
+            hbox.addWidget(lbl)
+            hbox.addWidget(slider)
+            hbox.addWidget(value_label)
+            layout.addLayout(hbox)
+        layout.addStretch()
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Reset)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        button_box.button(QDialogButtonBox.Reset).clicked.connect(lambda: [s.setValue(0) for s in self.sliders])
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+
+        # when preset changes, update sliders
+        self.preset_combo.currentIndexChanged.connect(self._apply_selected_preset)
+
+        # apply initial gains or preset
+        if initial_gains and len(initial_gains) >= len(self.sliders):
+            # try to find preset match
+            for name, vals in self.presets.items():
+                if all(int(vals[i]) == int(initial_gains[i]) for i in range(len(vals))):
+                    self.preset_combo.setCurrentText(name)
+                    break
+            else:
+                self.preset_combo.setCurrentText("Custom")
+        else:
+            self._apply_selected_preset(0)
+
+    def get_gains(self):
+        return [s.value() for s in self.sliders]
+
+    def _apply_selected_preset(self, idx):
+        try:
+            name = self.preset_combo.currentText()
+            if name in self.presets:
+                vals = self.presets[name]
+                for i, s in enumerate(self.sliders):
+                    s.setValue(int(vals[i]))
+        except Exception:
+            pass
+
+
 class AboutDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -379,7 +842,7 @@ class AboutDialog(QDialog):
         info_text_browser.setHtml(
             """
             <p align="center"><b>NVPlayer v1.0.0</b></p>
-            <p align="center">2025-2025 NVP / MY</p> <p align="center">Qt 5.15.2 기반</p>
+            <p align="center">2025-2026 NVP / MY</p> <p align="center">Qt 5.15.2 기반</p>
             <p align="center">음악 감상을 위한 강력한 플레이어</p>
             <p align="center"><a href="https://github.com/ningning-voice">개발자 GitHub</p>
             <p align="center">아이디어 제공: wns0377@naver.com</p> <p align="center">이용해주셔서 감사합니다.</p>
@@ -430,7 +893,9 @@ class MetadataMusicPlayer(QWidget):
 
         if "Medium" in self.pretendard_fonts: QApplication.instance().setFont(self.pretendard_fonts["Medium"])
 
-        self.pixmap_cache = {}
+        # LRU 캐시 (최대 100개 항목)
+        self.pixmap_cache = OrderedDict()
+        self.MAX_PIXMAP_CACHE = 100
         self.scan_thread = None
         self.scan_worker = None
         self.current_view = "artists"
@@ -447,11 +912,15 @@ class MetadataMusicPlayer(QWidget):
         self.sort_ascending = True
         self.folder_path = ""
         self.playback_history = []
+        # 미니 플레이어 토글 시 메인 윈도우 위치 저장
+        self.main_window_geometry = None
         # 사용자 설정: 곡마다 mixer를 강제 재초기화할지 여부 (True면 항상 재초기화, False면 필요시만 재초기화)
         self.force_mixer_reinit = False  # 기존 동작 유지하려면 True로 설정
         self.history_max_size = 100
         self.is_muted = False
         self.previous_volume = 0.5
+        # equalizer gains (in dB) for 10-band graphic EQ: [31.25Hz,62.5Hz,125Hz,250Hz,500Hz,1kHz,2kHz,4kHz,8kHz,16kHz]
+        self.eq_gains = [0] * 10
         self.default_stylesheet = """
             QWidget { background-color: #E6E6FA; color: #1b1b1b; font-size: 12px; }
             QGroupBox { background-color: rgba(230,230,250,0.9); border: 1px solid #CFCFCF; border-radius: 10px; margin-top: 10px; padding: 10px; color: #1b1b1b; }
@@ -493,6 +962,19 @@ class MetadataMusicPlayer(QWidget):
         except pygame.error as e:
             self.pygame_initialized = False
             QMessageBox.critical(self, "오류", f"Pygame Mixer 초기화 불가: {e}")
+        # sounddevice-based player (preferred for native FLAC playback)
+        self.use_sounddevice = SOUNDDEVICE_AVAILABLE
+        if self.use_sounddevice:
+            try:
+                self.audio_player = SoundDevicePlayer()
+                # propagate any existing EQ settings
+                self.audio_player.set_eq_gains(self.eq_gains)
+            except Exception:
+                self.use_sounddevice = False
+                self.audio_player = None
+        else:
+            self.audio_player = None
+        print(f"SoundDevice available: {self.use_sounddevice}")
         self.setup_ui()
         self.load_library()
         self.load_playlist()
@@ -504,7 +986,10 @@ class MetadataMusicPlayer(QWidget):
             self.check_playback_timer.setInterval(1000)
             self.check_playback_timer.timeout.connect(self.check_playback_status)
         self.setStyleSheet(self.default_stylesheet)
-        self.volume_label.setText(f"{int(self.current_volume * 100)}%")
+        try:
+            self.volume_label.setText(f"{self.volume_slider.value()}%")
+        except Exception:
+            self.volume_label.setText(f"{int(self.current_volume * 100)}%")
         
     def define_icons(self):
         """애플리케이션에서 사용할 모든 아이콘을 정의합니다."""
@@ -526,7 +1011,7 @@ class MetadataMusicPlayer(QWidget):
 
     def init_database(self):
         """데이터베이스와 tracks 테이블을 초기화합니다."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS tracks (
@@ -540,13 +1025,31 @@ class MetadataMusicPlayer(QWidget):
             raw_duration REAL,
             lyrics TEXT
         )""")
+        # create an FTS5 virtual table for fast full-text search if supported
+        try:
+            cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(path, artist, album, title, content='')")
+            # populate FTS from existing tracks if empty
+            cursor.execute("SELECT count(*) FROM tracks_fts")
+            cnt = cursor.fetchone()[0]
+            if cnt == 0:
+                cursor.execute("INSERT INTO tracks_fts (rowid, path, artist, album, title) SELECT NULL, path, artist, album, title FROM tracks")
+        except Exception:
+            # FTS5 may not be available; ignore and fallback to LIKE searches
+            pass
         conn.commit()
         conn.close()
+        # 오래된 캐시 파일 정리 (30일 이상 된 파일)
+        self.cleanup_old_cache_files()
 
     def setup_menubar(self):
         self.menubar = QMenuBar(self)
         file_menu = self.menubar.addMenu("파일(&F)")
         if "Medium" in self.pretendard_fonts:
+            settings_action = QAction("설정(&S)", self)
+            settings_action.setFont(self.pretendard_fonts["Medium"])
+            settings_action.triggered.connect(self.show_settings_dialog)
+            file_menu.addAction(settings_action)
+            file_menu.addSeparator()
             exit_action = QAction("종료(&X)", self)
             exit_action.setFont(self.pretendard_fonts["Medium"])
             exit_action.triggered.connect(self.close)
@@ -747,7 +1250,7 @@ class MetadataMusicPlayer(QWidget):
         self.stop_button.clicked.connect(self.stop_music)
         self.shuffle_button.clicked.connect(self.toggle_shuffle)
         self.repeat_button.clicked.connect(self.toggle_repeat)
-        self.eq_button.clicked.connect(lambda: QMessageBox.information(self, "기능 안내", "미구현 입니다."))
+        self.eq_button.clicked.connect(self.show_eq_dialog)
         self.mini_mode_button.clicked.connect(self.toggle_mini_player)
         self.progress_slider.sliderReleased.connect(self.set_playback_position)
         self.progress_slider.sliderMoved.connect(self.update_time_label_on_move)
@@ -755,12 +1258,67 @@ class MetadataMusicPlayer(QWidget):
         self.volume_slider.valueChanged.connect(self.update_volume_label)
         self.volume_icon.clicked.connect(self.toggle_mute)
 
+    def show_settings_dialog(self):
+        dialog = SettingsDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            settings = dialog.get_settings()
+            self.save_settings(settings)
+            backend = settings.get("audio_backend")
+            device = settings.get("audio_device")
+            if backend == "pygame":
+                self.use_sounddevice = False
+            elif backend == "sounddevice" and SOUNDDEVICE_AVAILABLE:
+                self.use_sounddevice = True
+            elif backend == "auto":
+                self.use_sounddevice = SOUNDDEVICE_AVAILABLE
+            if device is not None and SOUNDDEVICE_AVAILABLE:
+                try:
+                    sd.default.device = device
+                except Exception:
+                    pass
+            QMessageBox.information(self, "설정", "설정이 저장되었습니다.\n다음 곡부터 적용됩니다.")
+
+    def show_eq_dialog(self):
+        dialog = EQDialog(self, initial_gains=self.eq_gains)
+        if dialog.exec_() == QDialog.Accepted:
+            new_gains = dialog.get_gains()
+            self.eq_gains = new_gains
+            # propagate to backend player if in use
+            if self.use_sounddevice and self.audio_player:
+                self.audio_player.set_eq_gains(self.eq_gains)
+            # save EQ gains and selected preset to settings file
+            preset_name = dialog.preset_combo.currentText() if hasattr(dialog, 'preset_combo') else None
+            settings_to_save = {"eq_gains": self.eq_gains}
+            if preset_name:
+                settings_to_save["eq_preset"] = preset_name
+            merge_json_file("player_settings.json", settings_to_save)
+            QMessageBox.information(self, "이퀄라이저", "이퀄라이저 설정이 저장되었습니다.\n(사운드디바이스 백엔드 사용 시에만 적용됩니다)")
+
+    def save_settings(self, settings):
+        try:
+            merge_json_file("player_settings.json", settings)
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+
     def show_about_dialog(self): AboutDialog(self).exec_()
     def update_volume_label(self, value):
         self.volume_label.setText(f"{value}%")
         if value > 0 and self.is_muted:
             self.is_muted = False
             self.volume_icon.setPixmap(self.volume_pixmap.scaled(24, 24, Qt.KeepAspectRatio))
+
+    def _apply_volume_to_backend(self, value_float):
+        # apply volume to whichever backend is active
+        if getattr(self, "use_sounddevice", False) and self.audio_player:
+            try:
+                self.audio_player.set_volume(value_float)
+            except Exception:
+                pass
+        if self.pygame_initialized:
+            try:
+                pygame.mixer.music.set_volume(value_float)
+            except Exception:
+                pass
 
     def setup_visualizer(self):
         self.visualizer_scene.clear()
@@ -787,13 +1345,13 @@ class MetadataMusicPlayer(QWidget):
         if not self.pygame_initialized: return
         if self.is_muted:
             target_volume = self.previous_volume if self.previous_volume > 0 else 0.5
-            pygame.mixer.music.set_volume(target_volume)
+            self._apply_volume_to_backend(target_volume)
             self.volume_slider.setValue(int(target_volume * 100))
             self.volume_icon.setPixmap(self.volume_pixmap.scaled(24, 24, Qt.KeepAspectRatio))
             self.is_muted = False
         else:
             self.previous_volume = self.current_volume
-            pygame.mixer.music.set_volume(0)
+            self._apply_volume_to_backend(0)
             self.volume_slider.setValue(0)
             self.volume_icon.setPixmap(self.mute_pixmap.scaled(24, 24, Qt.KeepAspectRatio))
             self.is_muted = True
@@ -940,6 +1498,7 @@ class MetadataMusicPlayer(QWidget):
         self.scan_thread.started.connect(self.scan_worker.run)
         self.scan_worker.finished.connect(self.on_scan_finished)
         self.scan_worker.progress.connect(self.update_progress_label)
+        self.scan_worker.batch.connect(self.on_scan_batch)
         self.scan_worker.error.connect(self.on_scan_error)
 
         self.scan_worker.finished.connect(self.scan_thread.quit)
@@ -964,12 +1523,21 @@ class MetadataMusicPlayer(QWidget):
         self.label.setText("오류 발생. 다른 폴더를 선택해주세요.")
         self.open_folder_button.setEnabled(True)
 
+    def on_scan_batch(self, added_so_far, total_new):
+        try:
+            self.label.setText(self.truncate_text(f"라이브러리 업데이트 중... 추가됨: {added_so_far}/{total_new}", 100))
+        except Exception:
+            pass
+
     def create_rounded_pixmap(self, file_path, width, height, radius):
         """디스크 캐시를 확인/생성하고 둥근 QPixmap 객체를 반환합니다."""
         if not file_path: return None
-        cache_key = hashlib.md5(f"{file_path}:{width}x{height}".encode()).hexdigest()
+        try:
+            mtime = os.path.getmtime(file_path)
+        except Exception:
+            mtime = None
+        cache_key = hashlib.md5(f"{file_path}:{width}x{height}:{mtime}".encode()).hexdigest()
         cached_thumb_path = os.path.join(self.cache_path, f"{cache_key}.png")
-
         if cached_thumb_path in self.pixmap_cache: return self.pixmap_cache[cached_thumb_path]
         
         if os.path.exists(cached_thumb_path):
@@ -982,7 +1550,11 @@ class MetadataMusicPlayer(QWidget):
             if not source_pixmap.loadFromData(image_data): return None
             
             pixmap = source_pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            pixmap.save(cached_thumb_path, "PNG")
+            # write thumbnail to disk (best-effort)
+            try:
+                pixmap.save(cached_thumb_path, "PNG")
+            except Exception:
+                pass
 
         rounded = QPixmap(pixmap.size())
         rounded.fill(Qt.transparent)
@@ -994,7 +1566,13 @@ class MetadataMusicPlayer(QWidget):
         painter.drawPixmap(0, 0, pixmap)
         painter.end()
 
+        # LRU 캐시 유지: 최대 크기 초과 시 가장 오래된 항목 제거
         self.pixmap_cache[cached_thumb_path] = rounded
+        if len(self.pixmap_cache) > self.MAX_PIXMAP_CACHE:
+            # 가장 오래된 항목(첫 번째) 제거
+            oldest_key = next(iter(self.pixmap_cache))
+            del self.pixmap_cache[oldest_key]
+        
         return rounded
 
     def show_album_cover(self, file_path, target_label=None):
@@ -1006,6 +1584,27 @@ class MetadataMusicPlayer(QWidget):
         else:
             label.setText("앨범 커버 없음")
     
+    def cleanup_old_cache_files(self, days=30):
+        """지정된 일 수 이상 된 캐시 파일을 삭제합니다."""
+        try:
+            current_time = time.time()
+            cutoff_time = current_time - (days * 24 * 3600)  # n일 전
+            
+            if not os.path.exists(self.cache_path):
+                return
+            
+            for filename in os.listdir(self.cache_path):
+                file_path = os.path.join(self.cache_path, filename)
+                if os.path.isfile(file_path):
+                    file_mtime = os.path.getmtime(file_path)
+                    if file_mtime < cutoff_time:
+                        try:
+                            os.remove(file_path)
+                        except Exception as e:
+                            print(f"캐시 파일 삭제 실패: {file_path}, {e}")
+        except Exception as e:
+            print(f"캐시 정리 중 오류: {e}")
+
     def _get_cover_data_from_file(self, file_path):
         """파일에서 직접 커버 이미지 바이너리를 추출합니다."""
         try:
@@ -1044,35 +1643,64 @@ class MetadataMusicPlayer(QWidget):
                 "is_shuffled": self.is_shuffled, "repeat_mode": self.repeat_mode, "last_played_row": self.current_row,
                 "current_volume": self.current_volume, "is_muted": self.is_muted, "previous_volume": self.previous_volume,
             }
-            with open("playback_state.json", "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
+            write_json_file("playback_state.json", state)
         except Exception as e: print(f"Error saving playback state: {e}")
 
     def load_playback_state(self):
         try:
-            if os.path.exists("playback_state.json"):
-                with open("playback_state.json", "r", encoding="utf-8") as f: state = json.load(f)
-                self.is_shuffled = state.get("is_shuffled", False)
-                self.repeat_mode = state.get("repeat_mode", 0)
-                self.current_row = state.get("last_played_row", -1)
-                self.current_volume = state.get("current_volume", 0.5)
-                self.is_muted = state.get("is_muted", False)
-                self.previous_volume = state.get("previous_volume", 0.5)
+            state = read_json_file("playback_state.json", {}) or {}
+            self.is_shuffled = state.get("is_shuffled", False)
+            self.repeat_mode = state.get("repeat_mode", 0)
+            self.current_row = state.get("last_played_row", -1)
+            self.current_volume = state.get("current_volume", 0.5)
+            self.is_muted = state.get("is_muted", False)
+            self.previous_volume = state.get("previous_volume", 0.5)
+            # Load audio/settings (including EQ)
+            settings = read_json_file("player_settings.json", {}) or {}
+            backend = settings.get("audio_backend", "auto")
+            device = settings.get("audio_device", None)
+            self.eq_gains = settings.get("eq_gains", [0] * 10)
+            # propagate to player if available
+            if self.use_sounddevice and self.audio_player:
+                self.audio_player.set_eq_gains(self.eq_gains)
+            if backend == "pygame":
+                self.use_sounddevice = False
+            elif backend == "sounddevice" and SOUNDDEVICE_AVAILABLE:
+                self.use_sounddevice = True
+            elif backend == "auto":
+                self.use_sounddevice = SOUNDDEVICE_AVAILABLE
+            if device is not None and SOUNDDEVICE_AVAILABLE:
+                try:
+                    sd.default.device = device
+                except Exception:
+                    pass
 
-                if self.pygame_initialized:
-                    if self.is_muted:
-                        pygame.mixer.music.set_volume(0)
-                        self.volume_slider.setValue(0)
-                        self.volume_icon.setPixmap(self.mute_pixmap.scaled(24, 24, Qt.KeepAspectRatio))
-                    else:
-                        pygame.mixer.music.set_volume(self.current_volume)
-                        self.volume_slider.setValue(int(self.current_volume * 100))
-                        self.volume_icon.setPixmap(self.volume_pixmap.scaled(24, 24, Qt.KeepAspectRatio))
-                self._update_button_ui()
-                if self.user_playlist and 0 <= self.current_row < len(self.user_playlist): self.update_now_playing()
+            if self.pygame_initialized:
+                if self.is_muted:
+                    self._apply_volume_to_backend(0)
+                    self.volume_slider.setValue(0)
+                    self.volume_icon.setPixmap(self.mute_pixmap.scaled(24, 24, Qt.KeepAspectRatio))
+                else:
+                    self._apply_volume_to_backend(self.current_volume)
+                    self.volume_slider.setValue(int(self.current_volume * 100))
+                    self.volume_icon.setPixmap(self.volume_pixmap.scaled(24, 24, Qt.KeepAspectRatio))
+            self._update_button_ui()
+            if self.user_playlist and 0 <= self.current_row < len(self.user_playlist):
+                self.update_now_playing()
         except (FileNotFoundError, json.JSONDecodeError):
+            # 파일이 없거나 손상된 경우 기본값 적용
+            self.is_shuffled = False
+            self.repeat_mode = 0
+            self.current_row = -1
+            self.current_volume = 0.5
+            self.is_muted = False
+            self.previous_volume = 0.5
+            
             if self.pygame_initialized: pygame.mixer.music.set_volume(self.current_volume)
             self.volume_slider.setValue(int(self.current_volume * 100))
+            self.volume_icon.setPixmap(self.volume_pixmap.scaled(24, 24, Qt.KeepAspectRatio))
+            # 버튼 상태 초기화
+            self._update_button_ui()
 
     def toggle_shuffle(self):
         self.is_shuffled = not self.is_shuffled
@@ -1086,18 +1714,25 @@ class MetadataMusicPlayer(QWidget):
 
     def toggle_mini_player(self):
         if self.isVisible():
+            # 메인 윈도우 숨기고 미니 플레이어 표시
+            self.main_window_geometry = self.geometry()  # 메인 윈도우 위치/크기 저장
             self.hide()
             self.update_now_playing()
+            # 미니 플레이어를 메인 윈도우의 현재 위치에 배치
+            self.mini_player.move(self.main_window_geometry.x(), self.main_window_geometry.y())
             self.mini_player.show()
         else:
+            # 메인 윈도우 표시하고 미니 플레이어 숨기기
             self.mini_player.hide()
+            # 저장된 위치에서 메인 윈도우 복원
+            if self.main_window_geometry:
+                self.setGeometry(self.main_window_geometry)
             self.show()
-            self.setGeometry(self.mini_player.pos().x(), self.mini_player.pos().y(), self.width(), self.height())
 
     def set_volume(self, value):
-        if not self.pygame_initialized: return
         self.current_volume = value / 100.0
-        pygame.mixer.music.set_volume(self.current_volume)
+        # apply to backend(s)
+        self._apply_volume_to_backend(self.current_volume)
         if value > 0 and self.is_muted:
             self.is_muted = False
             self.volume_icon.setPixmap(self.volume_pixmap.scaled(24, 24, Qt.KeepAspectRatio))
@@ -1114,8 +1749,31 @@ class MetadataMusicPlayer(QWidget):
         super().keyPressEvent(event)
 
     def play_pause_music(self):
-        if not self.pygame_initialized or not self.user_playlist: return
-        if not pygame.mixer.get_init():
+        if not self.user_playlist: return
+        # prefer sounddevice backend if available
+        if getattr(self, "use_sounddevice", False) and self.audio_player:
+            try:
+                if self.is_paused:
+                    self.audio_player.resume()
+                    self.is_paused = False
+                    self.play_pause_button.setIcon(self.pause_icon)
+                    self.mini_player.play_pause_button.setIcon(self.pause_icon)
+                    self.visualizer_timer.start(100)
+                elif self.audio_player.is_busy():
+                    self.audio_player.pause()
+                    self.is_paused = True
+                    self.play_pause_button.setIcon(self.play_icon)
+                    self.mini_player.play_pause_button.setIcon(self.play_icon)
+                    self.visualizer_timer.stop()
+                else:
+                    self.play_music()
+            except Exception as e:
+                QMessageBox.critical(self, "재생 오류", f"일시정지/재개 중 오류 발생: {e}")
+                self.stop_music()
+            return
+
+        # fallback to pygame
+        if not self.pygame_initialized or not pygame.mixer.get_init():
             QMessageBox.warning(self, "오류", "오디오 장치가 비활성화되어 재생할 수 없습니다.")
             return self.stop_music()
         try:
@@ -1131,27 +1789,66 @@ class MetadataMusicPlayer(QWidget):
                 self.play_pause_button.setIcon(self.play_icon)
                 self.mini_player.play_pause_button.setIcon(self.play_icon)
                 self.visualizer_timer.stop()
-            else: self.play_music()
+            else:
+                self.play_music()
         except pygame.error as e:
             QMessageBox.critical(self, "재생 오류", f"일시정지/재개 중 오류 발생: {e}")
             self.stop_music()
 
     def play_music(self, start_pos=0.0):
-        if not self.pygame_initialized or not self.user_playlist or not (0 <= self.current_row < len(self.user_playlist)):
+        if not self.user_playlist or not (0 <= self.current_row < len(self.user_playlist)):
             return self.stop_music()
-        
+
         track_info = self.user_playlist[self.current_row]
         self.selected_flac = track_info.get("path")
         if not self.selected_flac or not os.path.exists(self.selected_flac):
             QMessageBox.warning(self, "파일 없음", f"파일을 찾을 수 없습니다:\n{self.selected_flac}")
             return self.play_next()
 
+        # If sounddevice backend available, use it for native playback
+        if getattr(self, "use_sounddevice", False) and self.audio_player:
+            try:
+                try:
+                    audio_file_info = File(self.selected_flac, easy=False).info
+                    samplerate, channels = audio_file_info.sample_rate, audio_file_info.channels
+                    samplerate_str = f"{samplerate / 1000.0:.1f}kHz" if samplerate >= 1000 else f"{samplerate} Hz"
+                    bits_str = f"{audio_file_info.bits_per_sample} Bit" if hasattr(audio_file_info, 'bits_per_sample') else ""
+                    channels_str = "Stereo" if channels == 2 else "Mono"
+                    quality_info = " / ".join(filter(None, [samplerate_str, bits_str, channels_str]))
+                    self.audio_quality_label.setText(quality_info)
+                except Exception:
+                    self.audio_quality_label.setText("음질 정보 없음")
+
+                print(f"Using sounddevice backend to play: {self.selected_flac}")
+                self.audio_player.load(self.selected_flac)
+                self.audio_player.set_volume(self.current_volume)
+                self.audio_player.play(start_pos)
+                self.playback_start_offset_ms = int(float(start_pos) * 1000)
+                self.is_paused = False
+                self.update_playback_history(track_info)
+                self.show_history_view()
+                self.progress_slider.setMaximum(int(track_info.get("raw_duration", 0) * 1000))
+                self.progress_slider.setEnabled(True)
+                self.check_playback_timer.start()
+                self.visualizer_timer.start(100)
+                self.play_pause_button.setIcon(self.pause_icon)
+                self.mini_player.play_pause_button.setIcon(self.pause_icon)
+                self.update_now_playing()
+                self.playlist_view.selectRow(self.current_row)
+            except Exception as e:
+                QMessageBox.critical(self, "재생 오류", f"음악 재생 중 오류 발생:\n{os.path.basename(self.selected_flac)}\n{e}")
+                self.stop_music()
+                self.play_next()
+            return
+
+        # fallback to pygame-based playback
+        if not self.pygame_initialized:
+            return self.stop_music()
         try:
             try:
                 audio_file_info = File(self.selected_flac, easy=False).info
                 samplerate, channels = audio_file_info.sample_rate, audio_file_info.channels
                 bit_depth = 8 if hasattr(audio_file_info, 'bits_per_sample') and audio_file_info.bits_per_sample == 8 else -16
-                                # avoid unnecessary mixer reinitialization; reinit only if forced or settings differ
                 desired_mixer = (samplerate, bit_depth, channels)
                 try:
                     current_mixer = pygame.mixer.get_init()
@@ -1163,7 +1860,6 @@ class MetadataMusicPlayer(QWidget):
                         pygame.mixer.init(frequency=samplerate, size=bit_depth, channels=channels)
                     except Exception as e:
                         print(f"mixer reinit failed: {e}")
-                        # fallback to default init to keep playback working
                         try:
                             pygame.mixer.quit()
                             pygame.mixer.init()
@@ -1191,7 +1887,7 @@ class MetadataMusicPlayer(QWidget):
                     self._mixer_settings = None
                 self.audio_quality_label.setText("음질 정보 없음")
 
-            pygame.mixer.music.load(self.selected_flac) 
+            pygame.mixer.music.load(self.selected_flac)
             pygame.mixer.music.play(start=start_pos)
             self.playback_start_offset_ms = int(float(start_pos) * 1000)
             self.is_paused = False
@@ -1243,22 +1939,48 @@ class MetadataMusicPlayer(QWidget):
         self.play_music()
 
     def play_next(self):
-        if not self.user_playlist: return
-        if self.repeat_mode == 2: return self.play_music()
+        if not self.user_playlist:
+            return
 
-        next_row = random.randrange(len(self.user_playlist)) if self.is_shuffled else self.current_row + 1
-        if next_row >= len(self.user_playlist):
-            if self.repeat_mode == 1: next_row = 0
-            else: return self.stop_music()
-        
+        # 한 곡 반복 모드에서는 셔플 여부와 상관없이 현재 곡 재생
+        if self.repeat_mode == 2:
+            if self.pygame_initialized and pygame.mixer.music.get_busy():
+                pygame.mixer.music.fadeout(500)
+                QTimer.singleShot(500, self.play_music)
+            else:
+                self.play_music()
+            return
+
+        # 다음 곡 결정: 셔플이면 랜덤, 아니면 순차
+        if self.is_shuffled:
+            next_row = random.randrange(len(self.user_playlist))
+        else:
+            next_row = self.current_row + 1
+            if next_row >= len(self.user_playlist):
+                if self.repeat_mode == 1:
+                    next_row = 0
+                else:
+                    return self.stop_music()
+
         self.current_row = next_row
         if self.pygame_initialized and pygame.mixer.music.get_busy():
             pygame.mixer.music.fadeout(500)
             QTimer.singleShot(500, self.play_music)
-        else: self.play_music()
+        else:
+            self.play_music()
 
     def stop_music(self):
-        if self.pygame_initialized: pygame.mixer.music.stop()
+        # stop active backend
+        if getattr(self, "use_sounddevice", False) and self.audio_player:
+            try:
+                self.audio_player.stop()
+            except Exception:
+                pass
+        if self.pygame_initialized:
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
         if self.check_playback_timer.isActive(): self.check_playback_timer.stop()
         if self.visualizer_timer.isActive(): self.visualizer_timer.stop()
         self.is_paused = False
@@ -1279,40 +2001,46 @@ class MetadataMusicPlayer(QWidget):
         self.save_history()
         self.save_playback_state()
         if self.pygame_initialized: pygame.mixer.quit()
+        if getattr(self, "use_sounddevice", False) and self.audio_player:
+            try:
+                self.audio_player.stop()
+            except Exception:
+                pass
         QApplication.quit()
         event.accept()
 
     def save_playlist(self):
         try:
-            with open("user_playlist.json", "w", encoding="utf-8") as f:
-                json.dump(self.user_playlist, f, ensure_ascii=False, indent=2)
-        except Exception as e: print(f"Error saving playlist: {e}")
+            write_json_file("user_playlist.json", self.user_playlist)
+        except Exception as e:
+            print(f"Error saving playlist: {e}")
 
     def load_playlist(self):
         try:
             if os.path.exists("user_playlist.json"):
-                with open("user_playlist.json", "r", encoding="utf-8") as f:
-                    self.user_playlist = [track for track in json.load(f) if os.path.exists(track.get("path", ""))]
-                    self.show_playlist_view()
+                data = read_json_file("user_playlist.json", []) or []
+                self.user_playlist = [track for track in data if os.path.exists(track.get("path", ""))]
+                self.show_playlist_view()
         except (FileNotFoundError, json.JSONDecodeError): self.user_playlist = []
 
     def save_history(self):
         try:
-            with open("history.json", "w", encoding="utf-8") as f:
-                json.dump(self.playback_history, f, ensure_ascii=False, indent=2)
-        except Exception as e: print(f"Error saving history: {e}")
+            write_json_file("history.json", self.playback_history)
+        except Exception as e:
+            print(f"Error saving history: {e}")
 
     def load_history(self):
         try:
-            if os.path.exists("history.json"):
-                with open("history.json", "r", encoding="utf-8") as f: self.playback_history = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError): self.playback_history = []
+            data = read_json_file("history.json", []) or []
+            self.playback_history = data
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.playback_history = []
 
     def save_last_folder(self, folder):
         try:
-            with open("player_settings.json", "w", encoding="utf-8") as f:
-                json.dump({"last_folder": folder}, f, ensure_ascii=False, indent=2)
-        except Exception as e: print(f"Error saving last folder: {e}")
+            merge_json_file("player_settings.json", {"last_folder": folder})
+        except Exception as e:
+            print(f"Error saving last folder: {e}")
 
     def on_tab_changed(self, index):
         if index == 2: self.show_history_view()
@@ -1331,20 +2059,33 @@ class MetadataMusicPlayer(QWidget):
         if self.selected_flac: self.play_music(start_pos=self.progress_slider.value() / 1000.0)
 
     def update_progress_slider(self):
-        if not self.pygame_initialized or not pygame.mixer.music.get_busy(): return
         try:
-            pos_ms = pygame.mixer.music.get_pos()
+            if getattr(self, "use_sounddevice", False) and self.audio_player:
+                if not self.audio_player.is_busy(): return
+                pos_ms = self.audio_player.get_pos_ms()
+            else:
+                if not self.pygame_initialized or not pygame.mixer.music.get_busy(): return
+                pos_ms = pygame.mixer.music.get_pos()
+
             if pos_ms >= 0:
                 absolute_ms = int(pos_ms + self.playback_start_offset_ms)
                 if not self.progress_slider.isSliderDown(): self.progress_slider.setValue(absolute_ms)
                 self.update_time_label_on_move(absolute_ms)
-        except pygame.error: self.stop_music()
+        except Exception:
+            self.stop_music()
 
     def check_playback_status(self):
-        if not self.pygame_initialized or not self.user_playlist or self.current_row == -1: return
+        if not self.user_playlist or self.current_row == -1: return
         try:
-            if not pygame.mixer.music.get_busy() and not self.is_paused and self.selected_flac: self.play_next()
-        except pygame.error: self.stop_music()
+            if getattr(self, "use_sounddevice", False) and self.audio_player:
+                busy = self.audio_player.is_busy()
+            else:
+                busy = pygame.mixer.music.get_busy() if self.pygame_initialized else False
+
+            if not busy and not self.is_paused and self.selected_flac:
+                self.play_next()
+        except Exception:
+            self.stop_music()
         self.update_progress_slider()
 
     def update_playback_history(self, track_info):
@@ -1359,11 +2100,11 @@ class MetadataMusicPlayer(QWidget):
                 return self.show_artists_view()
             elif view_type == "all_tracks":
                 return self.show_all_tracks_view()
+        # prefer DB-backed search (FTS) for performance on large libraries
+        results = self.search_tracks_db(text)
 
-        filtered = [track for track in self.music_data if any(text.lower() in track.get(key, "").lower() for key in ["artist", "album", "title"])]
-        
         if view_type == "artists":
-            unique_artists = {track["artist"]: track for track in filtered if "artist" in track}
+            unique_artists = {track["artist"]: track for track in results if "artist" in track}
             filtered_artists = sorted(list(unique_artists.keys()), key=locale.strxfrm)
             self.artists_list_view.clear()
             for artist_name in filtered_artists:
@@ -1375,8 +2116,33 @@ class MetadataMusicPlayer(QWidget):
                 self.artists_list_view.addItem(item)
                 self.artists_list_view.setItemWidget(item, widget)
         elif view_type == "all_tracks":
-            self.current_playlist = sorted(filtered, key=lambda x: (locale.strxfrm(x.get("artist", "")), x.get("date", "0000"), locale.strxfrm(x.get("album", ""))))
+            self.current_playlist = results
             self.display_all_tracks_table()
+
+    def search_tracks_db(self, text):
+        """Search tracks using FTS if available, otherwise fallback to LIKE queries."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            # try FTS search first
+            try:
+                cursor.execute("SELECT t.* FROM tracks t JOIN tracks_fts f ON t.path = f.path WHERE tracks_fts MATCH ? ORDER BY artist, date, album", (text,))
+                rows = cursor.fetchall()
+                return [dict(r) for r in rows]
+            except Exception:
+                # fallback to simple LIKE search
+                like = f"%{text}%"
+                cursor.execute("SELECT * FROM tracks WHERE artist LIKE ? OR album LIKE ? OR title LIKE ? ORDER BY artist, date, album", (like, like, like))
+                rows = cursor.fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def play_music_from_playlist(self, item):
         self.current_row = self.playlist_view.row(item)
@@ -1575,6 +2341,24 @@ if __name__ == "__main__":
         app = QApplication(sys.argv)
         player = MetadataMusicPlayer()
         player.show()
+        # Auto-play support for testing via environment variable
+        autoplay = os.environ.get("NVPLAYER_AUTO_PLAY")
+        if autoplay and os.path.exists(autoplay):
+            try:
+                audio_info = File(autoplay)
+                raw_duration = audio_info.info.length if hasattr(audio_info, 'info') and hasattr(audio_info.info, 'length') else 0
+            except Exception:
+                raw_duration = 0
+            track = {
+                "path": autoplay,
+                "title": os.path.basename(autoplay),
+                "artist": "",
+                "raw_duration": raw_duration,
+                "duration": ScanWorker._format_duration(raw_duration),
+            }
+            player.user_playlist = [track]
+            player.current_row = 0
+            QTimer.singleShot(500, lambda: player.play_music())
         sys.exit(app.exec_())
     except Exception as e:
         traceback.print_exc()
