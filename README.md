@@ -44,7 +44,7 @@ The SoundDevice backend enables more advanced audio handling and processing.
 ---
 
 ### 🎚 10-Band Graphic Equalizer
-<img width="402" height="432" alt="스크린샷 2026-03-04 152825" src="https://github.com/user-attachments/assets/fad2fc4a-a287-4c19-a11e-17d974ab2fd0" />
+<img width="372" height="402" alt="스크린샷 2026-03-04 170356" src="https://github.com/user-attachments/assets/adfb367b-0b38-459b-8752-6fe66cfc5e57" />
 
 Includes a real-time 10-band EQ covering:
 
