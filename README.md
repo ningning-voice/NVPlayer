@@ -119,6 +119,8 @@ Compact playback window for lightweight control.
 1. Install Python 3.x
 2. Install dependencies: pip install PyQt5 mutagen pygame sounddevice soundfile numpy
 3. Run: python NVPlayer.py
+4. **This program is optimized for the Pretendard Font. If there is no font, it will be displayed as the default system font.**
+https://github.com/orioncactus/pretendard
 
 ---
 
@@ -156,3 +158,7 @@ To be honest, I can't add an English version. It's hard.
 P.P.P.S 
 
 I will update the English version soon, please wait a little bit.
+
+P.P.P.P.S
+
+I will Architectural Refactoring (Class Separation) and Font & Resource Optimization. ASAP
