@@ -732,12 +732,14 @@ class EQDialog(QDialog):
             "Rock": [4, 2, 1, 0, 0, 1, 2, 3, 3, 2],
         }
         preset_layout = QHBoxLayout()
-        preset_label = QLabel("프리셋:")
+        preset_label = QLabel("프리셋")
         self.preset_combo = QComboBox()
         for name in self.presets.keys():
             self.preset_combo.addItem(name)
         self.preset_combo.addItem("Custom")
         self.preset_combo.setCurrentIndex(0)
+        self.preset_combo.setFixedWidth(120)
+        
         preset_layout.addWidget(preset_label)
         preset_layout.addWidget(self.preset_combo)
         layout.addLayout(preset_layout)
@@ -746,6 +748,8 @@ class EQDialog(QDialog):
         for idx, label_text in enumerate(band_labels):
             hbox = QHBoxLayout()
             lbl = QLabel(label_text)
+            lbl.setFixedWidth(70)
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             slider = QSlider(Qt.Horizontal)
             slider.setRange(-12, 12)
             value_label = QLabel()
